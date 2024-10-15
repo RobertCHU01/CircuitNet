@@ -16,4 +16,6 @@ routability_ir_drop_prediction/CircuitNet-N28/training_set/*
 routability_ir_drop_prediction/CircuitNet-N28/IR_drop_features/*
 routability_ir_drop_prediction/CircuitNet-N28/IR_drop_features_decompressed/*
 routability_ir_drop_prediction/CuicuitNet-N14/*
+routability_ir_drop_prediction/CircuitNet-N28/File_Change_Test/
+
 
