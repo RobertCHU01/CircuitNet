@@ -9,6 +9,7 @@ os.system('mkdir -p %s && rm -rf %s/*' % (decompress_path, decompress_path))
 print('put all power data in power_t.tar.gz .')
 # os.system('cat ../IR_drop_features/power_t.tar.gz* > ../IR_drop_features/power_t.tar.gz')
 
+
 filelist = os.walk('../IR_drop_features')
 for parent,dirnames,filenames in filelist:
     for filename in filenames:
