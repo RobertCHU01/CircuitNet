@@ -9,6 +9,7 @@ from mmcv.utils.parrots_wrapper import _BatchNorm
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import os
 
 
 from collections import OrderedDict
@@ -138,7 +139,7 @@ class OutConv(nn.Module):
     def forward(self, x):
         return self.conv(x)
 
-
+iter_num = 0
 class MAVI(nn.Module):
     def __init__(self, 
                  in_channels=1, 
@@ -150,6 +151,7 @@ class MAVI(nn.Module):
         self.out_channels = out_channels
         self.bilinear = bilinear
 
+        # channel 1->64
         self.inc = DoubleConv3d(in_channels, 64)
         self.down1 = Down(64, 128)
         self.down2 = Down(128, 256)
@@ -161,19 +163,40 @@ class MAVI(nn.Module):
         self.up3 = Up(128, 64, bilinear)
         self.outc = OutConv(64, out_channels)
 
+    #
+    def save_tensor(self, tensor, filename):
+        save_path = 'work_dir/irdrop_mavi/'
+        if not os.path.exists(save_path):
+            os.makedirs(save_path)
+        file_path = os.path.join(save_path, filename)
+        torch.save(tensor, file_path)
 
     def forward(self, x):
         x_in = x[:, :, :self.out_channels, :, :]
         x1 = self.inc(x)
         x2 = self.down1(x1)
+        #
+        global iter_num
+        iter_num += 1
+        # self.save_tensor(x1, f'down1_input_{iter_num}.pth')
+        # self.save_tensor(x2, f'down1_output_{iter_num}.pth')
         x3 = self.down2(x2)
+        #
+        # self.save_tensor(x2, f'down2_input_{iter_num}.pth')
+        # self.save_tensor(x3, f'down2_output_{iter_num}.pth')
         x4 = self.down3(x3)
+        if (iter_num % 40 == 0):
+            self.save_tensor(x4, f'bottleneck_output_{iter_num}.pth')
+        # self.save_tensor(x3, f'down3_input_{iter_num}.pth')
+        # self.save_tensor(x4, f'down3_output_{iter_num}.pth')
 
         x = self.up1(x4.mean(dim=2), x3.mean(dim=2))
         x = self.up2(x, x2.mean(dim=2))
         x = self.up3(x, x1.mean(dim=2))
         logits = self.outc(x)
 
+        # Save output of self.outc
+        # self.save_tensor(logits, f'outc_output_{iter_num}.pth')
         # logits = x_in.squeeze(1)*logits
         logits = x_in.squeeze(1)*logits
         return torch.sum(logits, dim=1)

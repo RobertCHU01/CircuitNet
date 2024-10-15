@@ -25,7 +25,7 @@ def test():
 
     arg_dict['ann_file'] = arg_dict['ann_file_test'] 
     arg_dict['test_mode'] = True
-
+    print(arg_dict)
     print('===> Loading datasets')
     # Initialize dataset
     dataset = build_dataset(arg_dict)

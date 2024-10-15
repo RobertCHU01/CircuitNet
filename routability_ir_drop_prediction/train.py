@@ -104,6 +104,7 @@ def train():
 
     arg_dict['ann_file'] = arg_dict['ann_file_train']
     arg_dict['test_mode'] = False 
+    print(arg_dict)
 
     print('===> Loading datasets')
     # Initialize dataset
@@ -128,10 +129,13 @@ def train():
     epoch_loss = 0
     iter_num = 0
     print_freq = 100
-    save_freq = 10000
+    # save_freq = 10000
+    save_freq = 100
+
 
     while iter_num < arg_dict['max_iters']:
         with tqdm(total=print_freq) as bar:
+            # print(len(dataset))      497 batches
             for feature, label, _ in dataset:        
                 if arg_dict['cpu']:
                     input, target = feature, label
@@ -142,6 +146,7 @@ def train():
                 cosine_lr._set_lr(optimizer, regular_lr)
 
                 prediction = model(input)
+                # print(input.shape)
 
                 optimizer.zero_grad()
                 pixel_loss = loss(prediction, target)
@@ -152,8 +157,9 @@ def train():
 
                 iter_num += 1
                 
-                bar.update(1)
+                bar.update(1)   # bar increases by one when model goes through one batch in dataset instead of full dataset
 
+                # print_freq = 100, which means for loop only goes through batches 0 - 99
                 if iter_num % print_freq == 0:
                     break
 

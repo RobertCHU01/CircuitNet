@@ -15,8 +15,8 @@ class Parser(object):
         self.parser.add_argument('--save_path', default='work_dir/congestion_gpdl/')
     
         self.parser.add_argument('--pretrained', default=None)
-
-        self.parser.add_argument('--max_iters', default=200000)
+        # origin: 200000
+        self.parser.add_argument('--max_iters', default=800)
         self.parser.add_argument('--plot_roc', action='store_true')
         self.parser.add_argument('--arg_file', default=None)
         self.parser.add_argument('--cpu', action='store_true')
@@ -58,7 +58,8 @@ class Parser(object):
 
 
         elif self.parser.parse_args().task == 'irdrop_mavi':
-            self.parser.add_argument('--dataroot', default='../../training_set/IR_drop')
+            # self.parser.add_argument('--dataroot', default='../../training_set/IR_drop')
+            self.parser.add_argument('--dataroot', default='CircuitNet-N28/training_set/IR_drop')
             self.parser.add_argument('--ann_file_train', default='./files/train_N28.csv')
             self.parser.add_argument('--ann_file_test', default='./files/test_N28.csv')
             self.parser.add_argument('--dataset_type', default='IRDropDataset')

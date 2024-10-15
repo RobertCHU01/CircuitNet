@@ -36,3 +36,4 @@ def build_dataset(opt):
         return DataLoader(dataset=dataset, num_workers=1, batch_size=1, shuffle=False)
     else:
         return IterLoader(DataLoader(dataset=dataset, num_workers=16, batch_size=opt.pop('batch_size'), shuffle=True, drop_last=True, pin_memory=True))
+        # return IterLoader(DataLoader(dataset=dataset, num_workers=10, batch_size=opt.pop('batch_size'), shuffle=True, drop_last=True, pin_memory=True))
