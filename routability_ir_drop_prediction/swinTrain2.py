@@ -1,39 +1,24 @@
 import os
 import numpy as np
+import json
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
-from torchvision import transforms
-from PIL import Image
+import torch.optim as optim
 from tqdm import tqdm
-from swintransformer import *
-from train import CosineRestartLr
-import math
+from torch.utils.data import DataLoader
+from swintransformer import init_model
 from utils.losses import build_loss
+from utils.configs import Parser
+from math import cos, pi
+from train import CosineRestartLr as BaseCosineRestartLr
+import torch.nn.functional as F
 
-class SimpleModel(nn.Module):
-    def __init__(self, input_channels=4):
-        super(SimpleModel, self).__init__()
-        self.conv1 = nn.Conv2d(input_channels, 64, kernel_size=3, padding=1)
-        self.conv2 = nn.Conv2d(64, 64, kernel_size=3, padding=1)
-        self.conv3 = nn.Conv2d(64, 1, kernel_size=3, padding=1)
-
-    def forward(self, x):
-        x = F.relu(self.conv1(x))
-        x = F.relu(self.conv2(x))
-        # x = F.leaky_relu()
-        x = self.conv3(x)
-        return x.squeeze(1)
-    
-class PowerDataset(Dataset):
-    def __init__(self, root_dir, target_size=(224, 224), max_samples=400):  # max_samples=100
+class PowerDataset(torch.utils.data.Dataset):
+    def __init__(self, root_dir, target_size=(224, 224), max_samples=400):
         self.root_dir = root_dir
         self.feature_dirs = ['power_i', 'power_s', 'power_sca', 'Power_all']
         self.label_dir = 'IR_drop'
         self.target_size = target_size
         self.data = []
-        
         for i, case_name in enumerate(os.listdir(os.path.join(root_dir, self.feature_dirs[0]))):
             feature_paths = [os.path.join(root_dir, feature_dir, case_name) for feature_dir in self.feature_dirs]
             label_path = os.path.join(root_dir, self.label_dir, case_name)
@@ -65,105 +50,111 @@ class PowerDataset(Dataset):
         label = (torch.log10(label) + 6) / (np.log10(50) + 6)
         
         return features, label
-
+    
     @staticmethod
     def normalize(tensor):
-        if tensor.max() == tensor.min():
+        min_val = tensor.min()
+        max_val = tensor.max()
+        if min_val == max_val:
             return torch.zeros_like(tensor)
-        return (tensor - tensor.min()) / (tensor.max() - tensor.min())
+        return (tensor - min_val) / (max_val - min_val)
 
-def setup_data(root_dir, batch_size=4):
-    dataset = PowerDataset(root_dir)
-    return DataLoader(dataset, batch_size=batch_size, shuffle=True)
+def build_dataset(arg_dict):
+    return PowerDataset(arg_dict['dataroot'])
 
-def train_model(model, dataloader, loss_fn, optimizer, num_epochs, device, save_path):
-    model.to(device)
-    model.train()
-    # Build lr scheduler
-    cosine_lr = CosineRestartLr(0.002, [100], [1], 1e-7)  # learning_rate, max_iters, [1], min_learning_rate
+class CosineRestartLr(BaseCosineRestartLr):
+    def __init__(self, base_lr, periods, restart_weights=[1], min_lr=None):
+        super().__init__(base_lr, periods, restart_weights, min_lr)
+        self.cumulative_periods = [sum(self.periods[:i+1]) for i in range(len(self.periods))]
+
+    def get_lr(self, iter_num, base_lr):
+        if iter_num >= self.cumulative_periods[-1]:
+            return self.min_lr or 0.0
+        return super().get_lr(iter_num, base_lr)
+
+    def get_regular_lr(self, iter_num):
+        return [self.get_lr(iter_num, base_lr) for base_lr in self.base_lr]
+
+    def set_init_lr(self, optimizer):
+        for group in optimizer.param_groups:
+            group.setdefault('initial_lr', group['lr'])
+        self.base_lr = [group['initial_lr'] for group in optimizer.param_groups]
+
+
+def checkpoint(model, epoch, save_path):
+    if not os.path.exists(save_path):
+        os.makedirs(save_path)
+    model_out_path = f"{save_path}/model_iters_{epoch}.pth"
+    torch.save({'state_dict': model.state_dict()}, model_out_path)
+    print(f"Checkpoint saved to {model_out_path}")
+
+def train():
+    argp = Parser()
+    arg = argp.parser.parse_args()
+    arg_dict = vars(arg)
+    arg_dict = {'task': 'irdrop_mavi', 'save_path': 'work_dir/irdrop_mavi/', 'pretrained': None, 'max_iters': 2000, 'plot_roc': False, 'arg_file': None, 'cpu': True, 'dataroot': 'CircuitNet-N28/training_set/IR_drop', 'ann_file_train': './files/train_N28.csv', 'ann_file_test': './files/test_N28.csv', 'dataset_type': 'IRDropDataset', 'batch_size': 2, 'model_type': 'MAVI', 'in_channels': 1, 'out_channels': 4, 'lr': 0.0002, 'weight_decay': 0.01, 'loss_type': 'L1Loss', 'eval_metric': ['NRMS', 'SSIM'], 'threshold': 0.9885, 'ann_file': './files/train_N28.csv', 'test_mode': False}
+    if arg.arg_file is not None:
+        with open(arg.arg_file, 'rt') as f:
+            arg_dict.update(json.load(f))
+
+    if not os.path.exists(arg_dict['save_path']):
+        os.makedirs(arg_dict['save_path'])
+    with open(os.path.join(arg_dict['save_path'], 'arg.json'), 'wt') as f:
+        json.dump(arg_dict, f, indent=4)
+
+    print('===> Loading datasets')
+    dataset = build_dataset(arg_dict)
+    dataloader = DataLoader(dataset, batch_size=arg_dict['batch_size'], shuffle=True)
+
+    print('===> Building model')
+    model = init_model('swin_base_patch4_window7_224', input_channels=4, num_classes=0, pretrained=True)
+    if not arg_dict['cpu']:
+        model = model.cuda()
+    
+    loss_fn = build_loss(arg_dict)
+    optimizer = optim.AdamW(model.parameters(), lr=arg_dict['lr'], betas=(0.9, 0.999), weight_decay=arg_dict['weight_decay'])
+    cosine_lr = CosineRestartLr(arg_dict['lr'], [arg_dict['max_iters']], [1], 1e-7)
     cosine_lr.set_init_lr(optimizer)
 
+    epoch_loss = 0
+    iter_num = 0
     print_freq = 100
+    save_freq = 1000
 
-    for epoch in range(num_epochs):
-        epoch_loss = 0
-        total_iterations = len(dataloader)
-        iteration_loss = 0
-        with tqdm(total=total_iterations, desc=f"Epoch {epoch+1}/{num_epochs}") as pbar:
-            for i, (features, labels) in enumerate(dataloader, 1):
-                features, labels = features.to(device), labels.to(device)
-                # lr scheduler
-                regular_lr = cosine_lr.get_regular_lr(epoch)
-                cosine_lr._set_lr(optimizer, regular_lr)
+    model.train()
+    while iter_num < arg_dict['max_iters']:
+        with tqdm(total=print_freq) as bar:
+            for feature, label in dataloader:
+                if arg_dict['cpu']:
+                    input, target = feature, label
+                else:
+                    input, target = feature.cuda(), label.cuda()
 
-                outputs = model(features)
+                regular_lr = cosine_lr.get_regular_lr(iter_num)
+                for param_group, lr in zip(optimizer.param_groups, regular_lr):
+                    param_group['lr'] = lr
+
+                prediction = model(input)
                 optimizer.zero_grad()
-                outputs = outputs.squeeze(1)
-                loss = loss_fn(outputs, labels)
-                loss.backward()
+                pixel_loss = loss_fn(prediction, target)
+                epoch_loss += pixel_loss.item()
+                pixel_loss.backward()
+                
+                # Add gradient clipping
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                
                 optimizer.step()
-                
-                epoch_loss += loss.item()*100
-                iteration_loss += loss.item()*100
-                pbar.update(1)
-                pbar.set_postfix({'loss': f'{loss.item():.4f}'})
-                
-                if i % print_freq == 0 or i == total_iterations:
-                    print(f"Iteration {i}/{total_iterations}, Iteration Average Loss: {iteration_loss/print_freq:.4f}")
-                    iteration_loss = 0
 
-                # # Collect gradients
-                # gradients = {}
-                # for name, param in model.named_parameters():
-                #     if param.grad is not None:
-                #         gradients[name] = param.grad.clone().cpu().numpy()
-                # for name, grad in gradients.items():
-                #     print(f"Epoch {epoch}, Layer {name}: Mean gradient = {np.mean(grad)}")
-        
-        avg_loss = epoch_loss / total_iterations
-        print(f"Epoch {epoch+1}/{num_epochs}, Epoch Loss: {epoch_loss:.4f} Average Loss: {avg_loss:.4f}")
-        
-        if (epoch + 1) % 2 == 0:
-            # torch.save(model.state_dict(), f"{save_path}/model_epoch_{epoch+1}.pth")
-            torch.save(model.state_dict(), "full_model.pth")
+                iter_num += 1
+                bar.update(1)
 
-def unfreeze_layers(model, num_layers_to_unfreeze):
-    for i, (name, param) in enumerate(model.backbone.named_parameters()): # length 327
-        if i >= len(list(model.backbone.parameters())) - num_layers_to_unfreeze:
-            param.requires_grad = True
+                if iter_num % print_freq == 0:
+                    break
 
-def main():
-    # Hyperparameters
-    root_dir = './CircuitNet-N28/IR_drop_features_decompressed/'
-    batch_size = 4
-    num_epochs = 50
-    learning_rate = 0.002
-    save_path = './checkpoints'
-    arg_dict = {'task': 'irdrop_mavi', 'save_path': 'work_dir/irdrop_mavi/', 'pretrained': None, 'max_iters': 1, 'plot_roc': False, 'arg_file': None, 'cpu': True, 'dataroot': 'CircuitNet-N28/training_set/IR_drop', 'ann_file_train': './files/train_N28.csv', 'ann_file_test': './files/test_N28.csv', 'dataset_type': 'IRDropDataset', 'batch_size': 2, 'model_type': 'MAVI', 'in_channels': 1, 'out_channels': 4, 'lr': 0.0002, 'weight_decay': 0.01, 'loss_type': 'L1Loss', 'eval_metric': ['NRMS', 'SSIM'], 'threshold': 0.9885, 'ann_file': './files/train_N28.csv', 'test_mode': False}
-    
-    # Setup
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    dataloader = setup_data(root_dir, batch_size)
-    model_name = 'swin_base_patch4_window7_224'
-    # model_name = 'swin_base_patch4_window7_224.ms_in22k'
-    model = init_model(model_name, input_channels=4, num_classes=0, pretrained=True)
-    # model = SimpleModel(input_channels=4) 
-
-    # loss_fn = nn.L1Loss()
-    loss_fn = build_loss(arg_dict)
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
-
-    # try freeze layers
-    for param in model.backbone.parameters():
-        param.requires_grad = False
-    # unfreeze_layers(model, 200)
-
-
-    # Training
-    train_model(model, dataloader, loss_fn, optimizer, num_epochs, device, save_path)
-    
-    # Save final model
-    torch.save(model.state_dict(), f"{save_path}/final_model.pth")
+        print(f"===> Iters[{iter_num}]({iter_num}/{arg_dict['max_iters']}): Loss: {epoch_loss / print_freq:.4f}")
+        if iter_num % save_freq == 0:
+            checkpoint(model, iter_num, arg_dict['save_path'])
+        epoch_loss = 0
 
 if __name__ == "__main__":
-    main()
+    train()
