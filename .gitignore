@@ -17,5 +17,12 @@ routability_ir_drop_prediction/CircuitNet-N28/IR_drop_features/*
 routability_ir_drop_prediction/CircuitNet-N28/IR_drop_features_decompressed/*
 routability_ir_drop_prediction/CuicuitNet-N14/*
 routability_ir_drop_prediction/CircuitNet-N28/File_Change_Test/
+feature_extraction/*
+routability_ir_drop_prediction/full_model.pth
+routability_ir_drop_prediction/model_checkpoints/*
+routability_ir_drop_prediction/checkpoints/*
+
+
+
 
 
