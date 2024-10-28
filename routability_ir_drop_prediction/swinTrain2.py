@@ -8,6 +8,7 @@ from tqdm import tqdm
 from torch.utils.data import DataLoader, Dataset
 from swintransformer import init_model
 import torch.nn.functional as F
+import torchvision.transforms.functional as TF
 from torch.cuda.amp import GradScaler, autocast
 
 class AverageMeter:
@@ -26,6 +27,27 @@ class AverageMeter:
         self.count += n
         self.avg = self.sum / self.count
 
+class EnhancedDataAugmentation:
+    def __init__(self, config):
+        self.config = config
+        
+    def __call__(self, features, label):
+        if torch.rand(1) < 0.5:  # Random horizontal flip
+            features = torch.flip(features, [-1])
+            label = torch.flip(label, [-1])
+            
+        if torch.rand(1) < 0.5:  # Random vertical flip
+            features = torch.flip(features, [-2])
+            label = torch.flip(label, [-2])
+            
+        # Add Gaussian noise
+        if torch.rand(1) < 0.3:
+            noise = torch.randn_like(features) * 0.01
+            features = features + noise
+            features = features.clamp(0, 1)
+            
+        return features, label
+
 class PowerDataset(Dataset):
     def __init__(self, root_dir, target_size=(224, 224), max_samples=400, train=True):
         self.root_dir = root_dir
@@ -36,7 +58,6 @@ class PowerDataset(Dataset):
         self.data = []
         
         all_files = sorted(os.listdir(os.path.join(root_dir, self.feature_dirs[0])))
-        # Split data into train/val
         split_idx = int(len(all_files) * 0.8)  # 80% train, 20% val
         files_to_use = all_files[:split_idx] if train else all_files[split_idx:]
         
@@ -50,6 +71,8 @@ class PowerDataset(Dataset):
             
             if all(os.path.exists(fp) for fp in feature_paths) and os.path.exists(label_path):
                 self.data.append((feature_paths, label_path))
+        
+        self.augmentation = EnhancedDataAugmentation(get_training_config()) if train else None
 
     def __len__(self):
         return len(self.data)
@@ -77,15 +100,9 @@ class PowerDataset(Dataset):
         label = label.clamp(1e-6, 50)
         label = (torch.log10(label) + 6) / (np.log10(50) + 6)
         
-        if self.train:
-            # Apply data augmentation for training
-            if torch.rand(1) < 0.5:
-                features = torch.flip(features, dims=[-1])
-                label = torch.flip(label, dims=[-1])
-            if torch.rand(1) < 0.5:
-                features = torch.flip(features, dims=[-2])
-                label = torch.flip(label, dims=[-2])
-        
+        if self.train and self.augmentation is not None:
+            features, label = self.augmentation(features, label)
+            
         return features, label
     
     @staticmethod
@@ -96,32 +113,54 @@ class PowerDataset(Dataset):
             return torch.zeros_like(tensor)
         return (tensor - min_val) / (max_val - min_val)
 
-def calculate_accuracy(pred, target, threshold=0.1):
-    relative_error = torch.abs(pred - target) / (target + 1e-8)
-    correct = (relative_error <= threshold).float().mean()
-    return correct * 100.0
+class CustomLoss(nn.Module):
+    def __init__(self, smoothing=0.1):
+        super().__init__()
+        self.smoothing = smoothing
+        self.base_criterion = nn.L1Loss()
+        
+    def forward(self, pred, target):
+        # Base L1 loss
+        loss = self.base_criterion(pred, target)
+        
+        if self.smoothing > 0:
+            # Add regularization with label smoothing
+            smooth_target = target + torch.randn_like(target) * self.smoothing
+            smooth_loss = self.base_criterion(pred, smooth_target)
+            loss = 0.9 * loss + 0.1 * smooth_loss
+            
+        return loss
 
-def save_checkpoint(model, optimizer, scheduler, epoch, loss, accuracy, filename):
-    checkpoint = {
-        'epoch': epoch,
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'scheduler_state_dict': scheduler.state_dict(),
-        'loss': loss,
-        'accuracy': accuracy,
+def get_training_config():
+    return {
+        'batch_size': 32,
+        'epochs': 100,
+        'learning_rate': 5e-3,
+        'weight_decay': 1e-3,
+        'warmup_epochs': 5,
+        'min_lr': 1e-6,
+        'save_path': './checkpoints',
+        'dataroot': './CircuitNet-N28/IR_drop_features_decompressed/',
+        'print_freq': 10,
+        'save_freq': 5,
+        'accuracy_threshold': 0.1,
+        'early_stopping_patience': 10,
+        'device': torch.device('cuda' if torch.cuda.is_available() else 'cpu'),
+        'accumulation_steps': 2  # Gradient accumulation steps
     }
-    torch.save(checkpoint, filename)
-    print(f"Checkpoint saved: {filename}")
 
 class Trainer:
     def __init__(self, model, config):
         self.model = model
         self.config = config
         self.device = config['device']
+        self.accumulation_steps = config['accumulation_steps']
         self.setup_training()
+        self.best_val_acc = 0
+        self.patience_counter = 0
 
     def setup_training(self):
-        # Separate backbone and decoder parameters
+        # Separate parameters for backbone and decoder
         backbone_params = []
         decoder_params = []
         for name, param in self.model.named_parameters():
@@ -130,24 +169,22 @@ class Trainer:
             else:
                 decoder_params.append(param)
 
-        # Create optimizer with parameter groups
+        # Create optimizer with different learning rates
         self.optimizer = optim.AdamW([
             {'params': backbone_params, 'lr': self.config['learning_rate'] * 0.1},
             {'params': decoder_params, 'lr': self.config['learning_rate']}
         ], weight_decay=self.config['weight_decay'])
 
-        # Learning rate scheduler
+        # Learning rate scheduler with warmup
         self.scheduler = optim.lr_scheduler.OneCycleLR(
             self.optimizer,
             max_lr=[self.config['learning_rate'] * 0.1, self.config['learning_rate']],
             steps_per_epoch=self.config['steps_per_epoch'],
             epochs=self.config['epochs'],
-            pct_start=0.3,
-            div_factor=25,
-            final_div_factor=1e4
+            pct_start=0.3
         )
 
-        self.criterion = nn.L1Loss()
+        self.criterion = CustomLoss(smoothing=0.1)
         self.scaler = GradScaler()
 
     def train_epoch(self, dataloader, epoch):
@@ -156,6 +193,7 @@ class Trainer:
         accuracies = AverageMeter()
         
         pbar = tqdm(dataloader, desc=f'Epoch {epoch + 1}/{self.config["epochs"]}')
+        self.optimizer.zero_grad()
         
         for i, (features, labels) in enumerate(pbar):
             features = features.to(self.device)
@@ -164,27 +202,28 @@ class Trainer:
             # Mixed precision training
             with autocast():
                 outputs = self.model(features)
-                loss = self.criterion(outputs.squeeze(1), labels)
-                accuracy = calculate_accuracy(
-                    outputs.squeeze(1),
-                    labels,
-                    threshold=self.config['accuracy_threshold']
-                )
+                loss = self.criterion(outputs.squeeze(1), labels) / self.accumulation_steps
 
-            # Backward pass
-            self.optimizer.zero_grad()
+            # Calculate accuracy
+            accuracy = calculate_accuracy(
+                outputs.squeeze(1),
+                labels,
+                threshold=self.config['accuracy_threshold']
+            )
+
+            # Backward pass with gradient accumulation
             self.scaler.scale(loss).backward()
             
-            # Gradient clipping
-            self.scaler.unscale_(self.optimizer)
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-            
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
-            self.scheduler.step()
+            if (i + 1) % self.accumulation_steps == 0:
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=5.0)
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+                self.optimizer.zero_grad()
+                self.scheduler.step()
 
             # Update metrics
-            losses.update(loss.item(), features.size(0))
+            losses.update(loss.item() * self.accumulation_steps, features.size(0))
             accuracies.update(accuracy.item(), features.size(0))
 
             # Update progress bar
@@ -220,22 +259,37 @@ class Trainer:
 
         return losses.avg, accuracies.avg
 
-def train():
-    # Configuration
-    config = {
-        'batch_size': 16,
-        'epochs': 50,
-        'learning_rate': 2e-3,
-        'weight_decay': 1e-4,
-        'dataroot': './CircuitNet-N28/IR_drop_features_decompressed/',
-        'save_path': './checkpoints',
-        'print_freq': 10,
-        'save_freq': 5,
-        'accuracy_threshold': 0.1,
-        'device': torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    def check_early_stopping(self, val_acc):
+        if val_acc > self.best_val_acc:
+            self.best_val_acc = val_acc
+            self.patience_counter = 0
+            return False
+        else:
+            self.patience_counter += 1
+            if self.patience_counter >= self.config['early_stopping_patience']:
+                return True
+        return False
+
+def calculate_accuracy(pred, target, threshold=0.1):
+    relative_error = torch.abs(pred - target) / (target + 1e-8)
+    correct = (relative_error <= threshold).float().mean()
+    return correct * 100.0
+
+def save_checkpoint(model, optimizer, scheduler, epoch, loss, accuracy, filename):
+    checkpoint = {
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict(),
+        'loss': loss,
+        'accuracy': accuracy,
     }
-    
-    # Create save directory
+    torch.save(checkpoint, filename)
+    print(f"Checkpoint saved: {filename}")
+
+def train():
+    # Get configuration
+    config = get_training_config()
     os.makedirs(config['save_path'], exist_ok=True)
     
     # Initialize datasets and dataloaders
@@ -273,7 +327,6 @@ def train():
     trainer = Trainer(model, config)
     
     # Training loop
-    best_val_accuracy = 0
     for epoch in range(config['epochs']):
         # Training phase
         train_loss, train_acc = trainer.train_epoch(train_loader, epoch)
@@ -298,8 +351,7 @@ def train():
             )
         
         # Save best model
-        if val_acc > best_val_accuracy:
-            best_val_accuracy = val_acc
+        if val_acc > trainer.best_val_acc:
             save_checkpoint(
                 model,
                 trainer.optimizer,
@@ -309,7 +361,12 @@ def train():
                 val_acc,
                 os.path.join(config['save_path'], 'best_model.pth')
             )
-            print(f"New best model saved with validation accuracy: {best_val_accuracy:.2f}%")
+            print(f"New best model saved with validation accuracy: {val_acc:.2f}%")
+        
+        # Early stopping check
+        if trainer.check_early_stopping(val_acc):
+            print(f"Early stopping triggered after {epoch + 1} epochs")
+            break
 
 if __name__ == "__main__":
     train()
