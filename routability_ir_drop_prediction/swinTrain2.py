@@ -49,7 +49,8 @@ class EnhancedDataAugmentation:
         return features, label
 
 class PowerDataset(Dataset):
-    def __init__(self, root_dir, target_size=(224, 224), max_samples=400, train=True):
+    def __init__(self, root_dir, target_size=(224, 224), 
+                 max_train_samples=800, max_val_samples=80, train=True):
         self.root_dir = root_dir
         self.feature_dirs = ['power_i', 'power_s', 'power_sca', 'Power_all']
         self.label_dir = 'IR_drop'
@@ -58,11 +59,17 @@ class PowerDataset(Dataset):
         self.data = []
         
         all_files = sorted(os.listdir(os.path.join(root_dir, self.feature_dirs[0])))
-        split_idx = int(len(all_files) * 0.8)  # 80% train, 20% val
-        files_to_use = all_files[:split_idx] if train else all_files[split_idx:]
+        
+        if train:
+            files_to_use = all_files[:max_train_samples]
+        else:
+            # For validation, take the next set of samples after training
+            start_idx = max_train_samples
+            end_idx = max_train_samples + max_val_samples
+            files_to_use = all_files[start_idx:end_idx]
         
         for i, case_name in enumerate(files_to_use):
-            if i >= max_samples:
+            if i >= max_train_samples + max_val_samples:
                 break
                 
             feature_paths = [os.path.join(root_dir, feature_dir, case_name) 
