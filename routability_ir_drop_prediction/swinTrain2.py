@@ -1,6 +1,5 @@
 import os
 import numpy as np
-import json
 import torch
 import torch.optim as optim
 import torch.nn as nn
@@ -63,15 +62,11 @@ class PowerDataset(Dataset):
         if train:
             files_to_use = all_files[:max_train_samples]
         else:
-            # For validation, take the next set of samples after training
             start_idx = max_train_samples
             end_idx = max_train_samples + max_val_samples
             files_to_use = all_files[start_idx:end_idx]
         
-        for i, case_name in enumerate(files_to_use):
-            if i >= max_train_samples + max_val_samples:
-                break
-                
+        for case_name in files_to_use:
             feature_paths = [os.path.join(root_dir, feature_dir, case_name) 
                            for feature_dir in self.feature_dirs]
             label_path = os.path.join(root_dir, self.label_dir, case_name)
@@ -120,6 +115,27 @@ class PowerDataset(Dataset):
             return torch.zeros_like(tensor)
         return (tensor - min_val) / (max_val - min_val)
 
+def get_training_config():
+    return {
+        'batch_size': 8,  # Reduced batch size for CPU
+        'epochs': 50,
+        'learning_rate_decoder': 0.001,    # Reduced learning rate
+        'learning_rate_backbone': 0.0001,  # Reduced learning rate for backbone
+        'weight_decay': 1e-4,
+        'min_lr_decoder': 1e-6,
+        'min_lr_backbone': 1e-7,
+        'save_path': './checkpoints',
+        'dataroot': './CircuitNet-N28/IR_drop_features_decompressed/',
+        'print_freq': 10,
+        'save_freq': 5,
+        'accuracy_threshold': 0.1,
+        'early_stopping_patience': 15,
+        'device': torch.device('cpu'),  # Explicitly set to CPU
+        'accumulation_steps': 4,  # Increased for smaller batch size
+        'num_workers': 0,  # Set to 0 for CPU training
+        'pin_memory': False  # Set to False for CPU training
+    }
+
 class CustomLoss(nn.Module):
     def __init__(self, smoothing=0.1):
         super().__init__()
@@ -127,34 +143,25 @@ class CustomLoss(nn.Module):
         self.base_criterion = nn.L1Loss()
         
     def forward(self, pred, target):
-        # Base L1 loss
+        # Ensure pred and target have the same size
+        if pred.shape != target.shape:
+            pred = nn.functional.interpolate(
+                pred.unsqueeze(1) if pred.dim() == 3 else pred,
+                size=target.shape[-2:],
+                mode='bilinear',
+                align_corners=True
+            )
+            if pred.dim() == 4:
+                pred = pred.squeeze(1)
+                
         loss = self.base_criterion(pred, target)
         
         if self.smoothing > 0:
-            # Add regularization with label smoothing
             smooth_target = target + torch.randn_like(target) * self.smoothing
             smooth_loss = self.base_criterion(pred, smooth_target)
             loss = 0.9 * loss + 0.1 * smooth_loss
             
         return loss
-
-def get_training_config():
-    return {
-        'batch_size': 32,
-        'epochs': 100,
-        'learning_rate': 5e-3,
-        'weight_decay': 1e-3,
-        'warmup_epochs': 5,
-        'min_lr': 1e-6,
-        'save_path': './checkpoints',
-        'dataroot': './CircuitNet-N28/IR_drop_features_decompressed/',
-        'print_freq': 10,
-        'save_freq': 5,
-        'accuracy_threshold': 0.1,
-        'early_stopping_patience': 10,
-        'device': torch.device('cuda' if torch.cuda.is_available() else 'cpu'),
-        'accumulation_steps': 2  # Gradient accumulation steps
-    }
 
 class Trainer:
     def __init__(self, model, config):
@@ -178,17 +185,15 @@ class Trainer:
 
         # Create optimizer with different learning rates
         self.optimizer = optim.AdamW([
-            {'params': backbone_params, 'lr': self.config['learning_rate'] * 0.1},
-            {'params': decoder_params, 'lr': self.config['learning_rate']}
+            {'params': backbone_params, 'lr': self.config['learning_rate_backbone']},
+            {'params': decoder_params, 'lr': self.config['learning_rate_decoder']}
         ], weight_decay=self.config['weight_decay'])
 
-        # Learning rate scheduler with warmup
-        self.scheduler = optim.lr_scheduler.OneCycleLR(
+        # Use CosineAnnealingLR with different minimum LRs for backbone and decoder
+        self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
             self.optimizer,
-            max_lr=[self.config['learning_rate'] * 0.1, self.config['learning_rate']],
-            steps_per_epoch=self.config['steps_per_epoch'],
-            epochs=self.config['epochs'],
-            pct_start=0.3
+            T_max=self.config['epochs'] * self.config['steps_per_epoch'],
+            eta_min=self.config['min_lr_decoder']  # This is for the decoder
         )
 
         self.criterion = CustomLoss(smoothing=0.1)
@@ -206,19 +211,16 @@ class Trainer:
             features = features.to(self.device)
             labels = labels.to(self.device)
 
-            # Mixed precision training
             with autocast():
                 outputs = self.model(features)
                 loss = self.criterion(outputs.squeeze(1), labels) / self.accumulation_steps
 
-            # Calculate accuracy
             accuracy = calculate_accuracy(
                 outputs.squeeze(1),
                 labels,
                 threshold=self.config['accuracy_threshold']
             )
 
-            # Backward pass with gradient accumulation
             self.scaler.scale(loss).backward()
             
             if (i + 1) % self.accumulation_steps == 0:
@@ -229,11 +231,9 @@ class Trainer:
                 self.optimizer.zero_grad()
                 self.scheduler.step()
 
-            # Update metrics
             losses.update(loss.item() * self.accumulation_steps, features.size(0))
             accuracies.update(accuracy.item(), features.size(0))
 
-            # Update progress bar
             pbar.set_postfix({
                 'Loss': f'{losses.avg:.4f}',
                 'Acc': f'{accuracies.avg:.2f}%',
@@ -295,11 +295,9 @@ def save_checkpoint(model, optimizer, scheduler, epoch, loss, accuracy, filename
     print(f"Checkpoint saved: {filename}")
 
 def train():
-    # Get configuration
     config = get_training_config()
     os.makedirs(config['save_path'], exist_ok=True)
     
-    # Initialize datasets and dataloaders
     train_dataset = PowerDataset(config['dataroot'], train=True)
     val_dataset = PowerDataset(config['dataroot'], train=False)
     
@@ -319,10 +317,8 @@ def train():
         pin_memory=True
     )
     
-    # Update config with steps per epoch
     config['steps_per_epoch'] = len(train_loader)
     
-    # Initialize model
     model = init_model(
         'swin_base_patch4_window7_224',
         input_channels=4,
@@ -330,22 +326,16 @@ def train():
         pretrained=True
     ).to(config['device'])
     
-    # Initialize trainer
     trainer = Trainer(model, config)
     
-    # Training loop
     for epoch in range(config['epochs']):
-        # Training phase
         train_loss, train_acc = trainer.train_epoch(train_loader, epoch)
-        
-        # Validation phase
         val_loss, val_acc = trainer.validate(val_loader)
         
         print(f'Epoch {epoch + 1}/{config["epochs"]}:')
         print(f'Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%')
         print(f'Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%')
         
-        # Save checkpoints
         if (epoch + 1) % config['save_freq'] == 0:
             save_checkpoint(
                 model,
@@ -357,7 +347,6 @@ def train():
                 os.path.join(config['save_path'], f'checkpoint_epoch_{epoch + 1}.pth')
             )
         
-        # Save best model
         if val_acc > trainer.best_val_acc:
             save_checkpoint(
                 model,
@@ -370,7 +359,6 @@ def train():
             )
             print(f"New best model saved with validation accuracy: {val_acc:.2f}%")
         
-        # Early stopping check
         if trainer.check_early_stopping(val_acc):
             print(f"Early stopping triggered after {epoch + 1} epochs")
             break
