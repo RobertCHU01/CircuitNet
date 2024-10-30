@@ -1,3 +1,9 @@
+## Note
+This is a personal project forked from [CircuitNet](https://github.com/circuitnet/CircuitNet).
+
+
+In this project, I developed a swinTransformer-based [model](https://github.com/RobertCHU01/CircuitNet/blob/main/routability_ir_drop_prediction/swintransformer.py) to predict IR-drops, aiming to match MAVIREC's performance in the paper below.
+
 # CircuitNet: An Open-Source Dataset for Machine Learning Applications in Electronic Design Automation (EDA)
 
 ## Overview
