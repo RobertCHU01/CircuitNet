@@ -129,8 +129,8 @@ def train():
     epoch_loss = 0
     iter_num = 0
     print_freq = 100
-    # save_freq = 10000
-    save_freq = 100
+    save_freq = 1000
+    # save_freq = 100
 
 
     while iter_num < arg_dict['max_iters']:

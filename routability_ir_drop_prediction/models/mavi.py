@@ -172,6 +172,7 @@ class MAVI(nn.Module):
         torch.save(tensor, file_path)
 
     def forward(self, x):
+        # print(f"=== MAVI Input Shape ===\nShape: {x.shape}\nwhere:\n- B: Batch size ({x.shape[0]})\n- C: Channel count ({x.shape[1]} power features)\n- H, W: Height, Width ({x.shape[2]}x{x.shape[3]})")
         x_in = x[:, :, :self.out_channels, :, :]
         x1 = self.inc(x)
         x2 = self.down1(x1)
@@ -199,7 +200,9 @@ class MAVI(nn.Module):
         # self.save_tensor(logits, f'outc_output_{iter_num}.pth')
         # logits = x_in.squeeze(1)*logits
         logits = x_in.squeeze(1)*logits
-        return torch.sum(logits, dim=1)
+        output = torch.sum(logits, dim=1)
+        # print(f"=== MAVI Output Shape ===\nShape: {output.shape}\nwhere:\n- B: Batch size ({output.shape[0]})\n- H, W: Height, Width ({output.shape[1]}x{output.shape[2]})")
+        return output
 
     def init_weights(self, pretrained=None, strict=True, **kwargs):
         if isinstance(pretrained, str):

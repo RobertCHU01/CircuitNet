@@ -1,5 +1,6 @@
 {
     "files.associations": {
         "select.C": "cpp"
-    }
+    },
+    "git.ignoreLimitWarning": true
 }

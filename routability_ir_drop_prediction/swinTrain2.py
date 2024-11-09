@@ -7,7 +7,6 @@ from tqdm import tqdm
 from torch.utils.data import DataLoader, Dataset
 from swintransformer import init_model
 import torch.nn.functional as F
-import torchvision.transforms.functional as TF
 from torch.cuda.amp import GradScaler, autocast
 
 class AverageMeter:
@@ -26,30 +25,8 @@ class AverageMeter:
         self.count += n
         self.avg = self.sum / self.count
 
-class EnhancedDataAugmentation:
-    def __init__(self, config):
-        self.config = config
-        
-    def __call__(self, features, label):
-        if torch.rand(1) < 0.5:  # Random horizontal flip
-            features = torch.flip(features, [-1])
-            label = torch.flip(label, [-1])
-            
-        if torch.rand(1) < 0.5:  # Random vertical flip
-            features = torch.flip(features, [-2])
-            label = torch.flip(label, [-2])
-            
-        # Add Gaussian noise
-        if torch.rand(1) < 0.3:
-            noise = torch.randn_like(features) * 0.01
-            features = features + noise
-            features = features.clamp(0, 1)
-            
-        return features, label
-
 class PowerDataset(Dataset):
-    def __init__(self, root_dir, target_size=(224, 224), 
-                 max_train_samples=800, max_val_samples=80, train=True):
+    def __init__(self, root_dir, target_size=(224, 224), max_samples=None, train=True):
         self.root_dir = root_dir
         self.feature_dirs = ['power_i', 'power_s', 'power_sca', 'Power_all']
         self.label_dir = 'IR_drop'
@@ -58,31 +35,29 @@ class PowerDataset(Dataset):
         self.data = []
         
         all_files = sorted(os.listdir(os.path.join(root_dir, self.feature_dirs[0])))
-        
-        if train:
-            files_to_use = all_files[:max_train_samples]
+        if max_samples:
+            if train:
+                files_to_use = all_files[:int(0.9 * max_samples)]
+            else:
+                files_to_use = all_files[int(0.9 * max_samples):max_samples]
         else:
-            start_idx = max_train_samples
-            end_idx = max_train_samples + max_val_samples
-            files_to_use = all_files[start_idx:end_idx]
+            files_to_use = all_files
         
         for case_name in files_to_use:
             feature_paths = [os.path.join(root_dir, feature_dir, case_name) 
                            for feature_dir in self.feature_dirs]
             label_path = os.path.join(root_dir, self.label_dir, case_name)
-            
             if all(os.path.exists(fp) for fp in feature_paths) and os.path.exists(label_path):
                 self.data.append((feature_paths, label_path))
-        
-        self.augmentation = EnhancedDataAugmentation(get_training_config()) if train else None
 
     def __len__(self):
         return len(self.data)
-    
+
     def __getitem__(self, idx):
         feature_paths, label_path = self.data[idx]
         features = []
         
+        # Load and process features
         for fp in feature_paths:
             feature = np.load(fp)
             feature = torch.tensor(feature, dtype=torch.float32)
@@ -91,21 +66,22 @@ class PowerDataset(Dataset):
                                   mode='bilinear', 
                                   align_corners=True).squeeze()
             features.append(self.normalize(feature))
-        features = torch.stack(features, dim=0)
         
+        # Stack features with correct dimensions: (1, D, H, W)
+        features = torch.stack(features, dim=0)  # D, H, W
+        features = features.unsqueeze(0)  # Add channel dimension: 1, D, H, W
+        
+        # Load and process label
         label = np.load(label_path)
         label = torch.tensor(label, dtype=torch.float32)
         label = F.interpolate(label.unsqueeze(0).unsqueeze(0), 
                             size=self.target_size, 
                             mode='bilinear', 
-                            align_corners=True).squeeze()
+                            align_corners=True)
         label = label.clamp(1e-6, 50)
         label = (torch.log10(label) + 6) / (np.log10(50) + 6)
         
-        if self.train and self.augmentation is not None:
-            features, label = self.augmentation(features, label)
-            
-        return features, label
+        return features, label.squeeze(0)  # Return (1, D, H, W), (1, H, W)
     
     @staticmethod
     def normalize(tensor):
@@ -115,253 +91,107 @@ class PowerDataset(Dataset):
             return torch.zeros_like(tensor)
         return (tensor - min_val) / (max_val - min_val)
 
-def get_training_config():
-    return {
-        'batch_size': 8,  # Reduced batch size for CPU
-        'epochs': 50,
-        'learning_rate_decoder': 0.001,    # Reduced learning rate
-        'learning_rate_backbone': 0.0001,  # Reduced learning rate for backbone
-        'weight_decay': 1e-4,
-        'min_lr_decoder': 1e-6,
-        'min_lr_backbone': 1e-7,
-        'save_path': './checkpoints',
-        'dataroot': './CircuitNet-N28/IR_drop_features_decompressed/',
-        'print_freq': 10,
-        'save_freq': 5,
-        'accuracy_threshold': 0.1,
-        'early_stopping_patience': 15,
-        'device': torch.device('cpu'),  # Explicitly set to CPU
-        'accumulation_steps': 4,  # Increased for smaller batch size
-        'num_workers': 0,  # Set to 0 for CPU training
-        'pin_memory': False  # Set to False for CPU training
-    }
-
 class CustomLoss(nn.Module):
-    def __init__(self, smoothing=0.1):
+    def __init__(self):
         super().__init__()
-        self.smoothing = smoothing
-        self.base_criterion = nn.L1Loss()
+        self.l1_loss = nn.L1Loss()
+        self.mse_loss = nn.MSELoss()
         
     def forward(self, pred, target):
-        # Ensure pred and target have the same size
+        # Ensure shapes match
         if pred.shape != target.shape:
-            pred = nn.functional.interpolate(
-                pred.unsqueeze(1) if pred.dim() == 3 else pred,
-                size=target.shape[-2:],
-                mode='bilinear',
-                align_corners=True
-            )
-            if pred.dim() == 4:
-                pred = pred.squeeze(1)
-                
-        loss = self.base_criterion(pred, target)
+            pred = F.interpolate(pred.unsqueeze(1), size=target.shape[-2:], 
+                               mode='bilinear', align_corners=True).squeeze(1)
         
-        if self.smoothing > 0:
-            smooth_target = target + torch.randn_like(target) * self.smoothing
-            smooth_loss = self.base_criterion(pred, smooth_target)
-            loss = 0.9 * loss + 0.1 * smooth_loss
-            
-        return loss
+        # Combine L1 and MSE losses
+        l1 = self.l1_loss(pred, target)
+        mse = self.mse_loss(pred, target)
+        return 0.5 * l1 + 0.5 * mse
 
-class Trainer:
-    def __init__(self, model, config):
-        self.model = model
-        self.config = config
-        self.device = config['device']
-        self.accumulation_steps = config['accumulation_steps']
-        self.setup_training()
-        self.best_val_acc = 0
-        self.patience_counter = 0
-
-    def setup_training(self):
-        # Separate parameters for backbone and decoder
-        backbone_params = []
-        decoder_params = []
-        for name, param in self.model.named_parameters():
-            if 'backbone' in name:
-                backbone_params.append(param)
-            else:
-                decoder_params.append(param)
-
-        # Create optimizer with different learning rates
-        self.optimizer = optim.AdamW([
-            {'params': backbone_params, 'lr': self.config['learning_rate_backbone']},
-            {'params': decoder_params, 'lr': self.config['learning_rate_decoder']}
-        ], weight_decay=self.config['weight_decay'])
-
-        # Use CosineAnnealingLR with different minimum LRs for backbone and decoder
-        self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer,
-            T_max=self.config['epochs'] * self.config['steps_per_epoch'],
-            eta_min=self.config['min_lr_decoder']  # This is for the decoder
-        )
-
-        self.criterion = CustomLoss(smoothing=0.1)
-        self.scaler = GradScaler()
-
-    def train_epoch(self, dataloader, epoch):
-        self.model.train()
-        losses = AverageMeter()
-        accuracies = AverageMeter()
-        
-        pbar = tqdm(dataloader, desc=f'Epoch {epoch + 1}/{self.config["epochs"]}')
-        self.optimizer.zero_grad()
-        
-        for i, (features, labels) in enumerate(pbar):
-            features = features.to(self.device)
-            labels = labels.to(self.device)
-
-            with autocast():
-                outputs = self.model(features)
-                loss = self.criterion(outputs.squeeze(1), labels) / self.accumulation_steps
-
-            accuracy = calculate_accuracy(
-                outputs.squeeze(1),
-                labels,
-                threshold=self.config['accuracy_threshold']
-            )
-
-            self.scaler.scale(loss).backward()
-            
-            if (i + 1) % self.accumulation_steps == 0:
-                self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=5.0)
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-                self.optimizer.zero_grad()
-                self.scheduler.step()
-
-            losses.update(loss.item() * self.accumulation_steps, features.size(0))
-            accuracies.update(accuracy.item(), features.size(0))
-
-            pbar.set_postfix({
-                'Loss': f'{losses.avg:.4f}',
-                'Acc': f'{accuracies.avg:.2f}%',
-                'LR-backbone': f'{self.optimizer.param_groups[0]["lr"]:.6f}',
-                'LR-decoder': f'{self.optimizer.param_groups[1]["lr"]:.6f}'
-            })
-
-        return losses.avg, accuracies.avg
-
-    @torch.no_grad()
-    def validate(self, dataloader):
-        self.model.eval()
-        losses = AverageMeter()
-        accuracies = AverageMeter()
-
-        for features, labels in dataloader:
-            features = features.to(self.device)
-            labels = labels.to(self.device)
-
-            outputs = self.model(features)
-            loss = self.criterion(outputs.squeeze(1), labels)
-            accuracy = calculate_accuracy(
-                outputs.squeeze(1),
-                labels,
-                threshold=self.config['accuracy_threshold']
-            )
-
-            losses.update(loss.item(), features.size(0))
-            accuracies.update(accuracy.item(), features.size(0))
-
-        return losses.avg, accuracies.avg
-
-    def check_early_stopping(self, val_acc):
-        if val_acc > self.best_val_acc:
-            self.best_val_acc = val_acc
-            self.patience_counter = 0
-            return False
-        else:
-            self.patience_counter += 1
-            if self.patience_counter >= self.config['early_stopping_patience']:
-                return True
-        return False
-
-def calculate_accuracy(pred, target, threshold=0.1):
-    relative_error = torch.abs(pred - target) / (target + 1e-8)
-    correct = (relative_error <= threshold).float().mean()
-    return correct * 100.0
-
-def save_checkpoint(model, optimizer, scheduler, epoch, loss, accuracy, filename):
-    checkpoint = {
-        'epoch': epoch,
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'scheduler_state_dict': scheduler.state_dict(),
-        'loss': loss,
-        'accuracy': accuracy,
-    }
-    torch.save(checkpoint, filename)
-    print(f"Checkpoint saved: {filename}")
-
-def train():
-    config = get_training_config()
-    os.makedirs(config['save_path'], exist_ok=True)
+def train_model(config):
+    # Set up device
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
-    train_dataset = PowerDataset(config['dataroot'], train=True)
-    val_dataset = PowerDataset(config['dataroot'], train=False)
+    # Initialize datasets and dataloaders
+    train_dataset = PowerDataset(config['dataroot'], max_samples=100, train=True)
+    val_dataset = PowerDataset(config['dataroot'], max_samples=100, train=False)
     
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=config['batch_size'],
-        shuffle=True,
-        num_workers=4,
-        pin_memory=True
-    )
+    train_loader = DataLoader(train_dataset, batch_size=config['batch_size'],
+                            shuffle=True, num_workers=4, pin_memory=True)
+    val_loader = DataLoader(val_dataset, batch_size=config['batch_size'],
+                          shuffle=False, num_workers=4, pin_memory=True)
     
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=config['batch_size'],
-        shuffle=False,
-        num_workers=4,
-        pin_memory=True
-    )
+    # Initialize model
+    model = init_model('swin_base_patch4_window7_224', 
+                      input_channels=1, output_channels=4, 
+                      pretrained=True).to(device)
     
-    config['steps_per_epoch'] = len(train_loader)
+    # Set up optimizer with different learning rates for different parts
+    optimizer = optim.AdamW([
+        {'params': model.backbone.parameters(), 'lr': config['lr_backbone']},
+        {'params': model.initial_3d.parameters(), 'lr': config['lr_decoder']},
+        {'params': model.decoder.parameters(), 'lr': config['lr_decoder']},
+        {'params': model.final.parameters(), 'lr': config['lr_decoder']}
+    ], weight_decay=config['weight_decay'])
     
-    model = init_model(
-        'swin_base_patch4_window7_224',
-        input_channels=4,
-        num_classes=0,
-        pretrained=True
-    ).to(config['device'])
+    # Set up loss and scaler for mixed precision training
+    criterion = CustomLoss()
+    scaler = GradScaler()
     
-    trainer = Trainer(model, config)
-    
+    # Training loop
+    best_val_loss = float('inf')
     for epoch in range(config['epochs']):
-        train_loss, train_acc = trainer.train_epoch(train_loader, epoch)
-        val_loss, val_acc = trainer.validate(val_loader)
+        # Training phase
+        model.train()
+        train_loss = AverageMeter()
         
-        print(f'Epoch {epoch + 1}/{config["epochs"]}:')
-        print(f'Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.2f}%')
-        print(f'Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%')
+        with tqdm(total=len(train_loader), desc=f'Epoch {epoch+1}/{config["epochs"]}') as pbar:
+            for features, labels in train_loader:
+                features, labels = features.to(device), labels.to(device)
+                
+                with autocast():
+                    outputs = model(features)
+                    loss = criterion(outputs, labels)
+                
+                optimizer.zero_grad()
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+                
+                train_loss.update(loss.item(), features.size(0))
+                pbar.set_postfix({'train_loss': f'{train_loss.avg:.4f}'})
+                pbar.update()
         
-        if (epoch + 1) % config['save_freq'] == 0:
-            save_checkpoint(
-                model,
-                trainer.optimizer,
-                trainer.scheduler,
-                epoch,
-                val_loss,
-                val_acc,
-                os.path.join(config['save_path'], f'checkpoint_epoch_{epoch + 1}.pth')
-            )
+        # Validation phase
+        model.eval()
+        val_loss = AverageMeter()
         
-        if val_acc > trainer.best_val_acc:
-            save_checkpoint(
-                model,
-                trainer.optimizer,
-                trainer.scheduler,
-                epoch,
-                val_loss,
-                val_acc,
-                os.path.join(config['save_path'], 'best_model.pth')
-            )
-            print(f"New best model saved with validation accuracy: {val_acc:.2f}%")
+        with torch.no_grad():
+            for features, labels in val_loader:
+                features, labels = features.to(device), labels.to(device)
+                outputs = model(features)
+                loss = criterion(outputs, labels)
+                val_loss.update(loss.item(), features.size(0))
         
-        if trainer.check_early_stopping(val_acc):
-            print(f"Early stopping triggered after {epoch + 1} epochs")
-            break
+        print(f'Epoch {epoch+1}: Train Loss: {train_loss.avg:.4f}, Val Loss: {val_loss.avg:.4f}')
+        
+        # Save best model
+        if val_loss.avg < best_val_loss:
+            best_val_loss = val_loss.avg
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'val_loss': val_loss.avg,
+            }, 'best_model.pth')
 
 if __name__ == "__main__":
-    train()
+    config = {
+        'dataroot': './CircuitNet-N28/IR_drop_features_decompressed/',
+        'batch_size': 8,
+        'epochs': 100,
+        'lr_backbone': 1e-5,
+        'lr_decoder': 2e-4,
+        'weight_decay': 1e-4,
+    }
+    train_model(config)

@@ -16,7 +16,7 @@ class Parser(object):
     
         self.parser.add_argument('--pretrained', default=None)
         # origin: 200000
-        self.parser.add_argument('--max_iters', default=800)
+        self.parser.add_argument('--max_iters', default=200000)
         self.parser.add_argument('--plot_roc', action='store_true')
         self.parser.add_argument('--arg_file', default=None)
         self.parser.add_argument('--cpu', action='store_true')
